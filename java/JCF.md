@@ -165,25 +165,26 @@ TreeMap底层通过红黑树实现，这意味着TreeMap的containsKey()、get()
 		}
 	}
 TreeMap中不允许key为null，如get(Object key)方法，根据key返回对应的value
-public V get(Object key){
-	if(key == null){
-		//不允许key为null，否则抛出空指针异常
-	}
-	//先通过key找到对应的Entry
-	Entry<K,V> p = root;
-	while(p != null){
-		if(key.compareTo(p.key) < 0){//往左子树找
-			//根据key的本身顺序或者比较器定义的顺序比较key值。
-			p = p.left;
-		} else {                    //往右子树找
-			p = p.right;
-		} else {
-			return p;
+
+	public V get(Object key){
+		if(key == null){
+			//不允许key为null，否则抛出空指针异常
 		}
+		//先通过key找到对应的Entry
+		Entry<K,V> p = root;
+		while(p != null){
+			if(key.compareTo(p.key) < 0){//往左子树找
+				//根据key的本身顺序或者比较器定义的顺序比较key值。
+				p = p.left;
+			} else {                    //往右子树找
+				p = p.right;
+			} else {
+				return p;
+			}
+		}
+		//没有这个key
+		return null;
 	}
-	//没有这个key
-	return null;
-}
 往TreeMap中插入元素的时候，调用put(K key, V value)方法，如果该key已经存在，那么设置新值为value并返回旧值，如果该key不存在，那么找到合适的位置插入key，然后调整红黑树使其满足约素条件。
 
 	public V put（K key, V value）{
@@ -240,3 +241,107 @@ public V get(Object key){
 TreeSet基于TreeMap实现，在TreeSet中直接定义了一个TreeMap，相当于一个只使用key的TreeMap.
 
 这种设计模式成为**适配器模式。**
+
+## HashMap ##
+与TreeMap有序存放Entry不同，HashMap中的Entry是无序的。HashMap底层依靠一个数组和冲突链表实现，HashMap中两个重要的方法是hashCode()方法和equals()方法，其中hashCode方法决定了key对应的hash值，而hash值通过*(hash)&(table.length-1)*可以得到在数组中的下标，由于HashMap中数组的大小必须是2的指数倍，因此相当于对数组长度取模。而equals方法可以判断同一个冲突链表中的Entry是否相等。**注意：底层数组中是没有存放Entry的，只是指向存放在这个下标对应的冲突链表。**HashMap中可以放入key为null元素，以及value为null的元素。key为null的hash值为0，对应的数组下标也是0，可见最多只能放入一个key为null的Entry。
+
+根据key获得对应的value
+
+	public V get(Object key){
+		//获得下标	
+		int hash = (key==null)?0:hash(key);
+		int index = hash&(table.length-1);
+		//获得冲突链表
+		Entry<K,V> e = table[index];
+		for(; e!=null; e=e.next){
+			Object k;
+			if((k=e.key)==key && k.equals(key)){
+				return e;
+			}
+		}
+		return null;
+	}
+
+往HashMap中放入元素
+
+	public V put(Object key, V value){
+		//如果key已经存在，那么设置新value值，返回旧value
+		if(size>threshold && table[index]!=null){
+			//扩容并且重新hash
+			resize(2*table.length);
+			hash = (key==null)? 0 : hash(key);
+			index = hash&(table.length-1);
+		}
+		Entry<K,V> e = table[index];
+		//头插入法
+		table[index] = new Entry<K,V>(hash, key, value, e);
+		size++;
+	}
+
+## HashSet ##
+HashSet依靠HashMap实现，在HashSet中直接定义了一个HashMap。这也是**适配器模型。**
+
+## LinkedHashMap ##
+LinkedHashMap在底层实现上与HashMap相似，唯一的不同点在于：LinkedHashMap使用了一个header哑元，将所有的Entry连接起来，连接方式是双向链表。这也决定了LinkedHashMap在迭代的时候不需要遍历整个数组，而只需要遍历header连接的双向链表。
+
+根据key从LinkedHashMap中取出对应的value，与HashMap中的一样，先获取冲突链表，再遍历冲突链表。
+
+往LinkedHashMap中put元素的时候，除了需要把Entry采用头插入法插入到冲突链表中，还需要把Entry插入到header指向的双向链表中。插入到冲突链表中的方式与HashMap中一样，插入到双向链表中只需要将Entry插入到header节点的前一个节点即可。
+
+从LinkedHashMap中remove元素的时候，跟插入时候也是一样，需要从冲突链表中删除Entry，还需要从双向链表中删除Entry。
+
+## LinkedHashSet ##
+LinkedHashSet的实现基于LinkedHashMap，在LinkedHashSet中直接定义了一个LinkedHashMap。这也是**适配器模式。**
+
+## PriorityQueue ##
+PriorityQueue是Java中的优先队列，每次从队列中取出的元素一定是最小的。PriorityQueue依靠小顶堆实现，而小顶堆又是通过数组实现的，因此，PriorityQueue底层是依靠数组实现的小顶堆（每个节点的左右子节点都比自身大的完全二叉树）。因此堆顶元素是最小的，而且
+>leftchildNO = parentNO*2 + 1
+
+>rightchildNO = parentNO*2 + 2
+
+>parentNO = (childNO-1)/2
+
+往PriorityQueue新加元素的时候，**注意：PriorityQueue中不能放入null元素。**先将元素插入到数组最后面，即加入到完全二叉树的某个叶子节点。插入之后可能破坏了小顶堆的特性，因此需要调整，调整方法为自底向上的与父节点比较，直到比父节点大。
+
+	private void siftUp(int k, E x){
+		while(k>0){
+			int parentNO = (k-1)>>>2;
+			//既可以使用元素的自然大小顺序，也可以使用构造时传入的比较器
+			if(comparator.compare(x, queue[parentNO]) >= 0){
+				break;
+			}
+			queue[k] = queue[parentNO];
+			k = parentNO;
+			
+		}
+		queue[k] = x;
+	}
+PriorityQueue中element和peek等方法能在常数时间内完成，只需要获取首元素即可。
+
+PriorityQueue中remove或者poll等方法需要获取并删除首元素，删除了首元素之后，就破坏了小顶堆的特性，因此先获取堆顶元素用于返回，然后用数组的最后一个元素覆盖首元素，将最后一个元素置为null。此时小顶堆被破坏，我们采用自顶向下的方式调整小顶堆。
+
+	private void siftDown(int k, E x){
+		//	
+		int half = size >>> 1;
+		while(k < half){
+			int left = 2*k + 1;
+			Object o = queue[left];
+			int right = left +1;
+			if(right<size && queue[right]<o){
+				left = right;
+				o = queue[right];
+			}
+			if(comparator.compare(x, o) >= 0){
+				break;
+			}
+			queue[k] = o;
+			k = left;
+		}
+		queue[k] = x;
+	}
+
+
+## WeakHashMap ##
+WeakHashMap结构上与HashMap几乎一致，唯一的区别在于WeakHashMap中所有的Entry都是弱引用，弱引用就是该引用可能会被GC自动回收。WeakHashMap的这种特性特别适合于***缓存场景***，WeakHashMap中的Entry要想不被GC自动回收，那么在WeakHashMap外必须还有强引用指向这个Entry。
+
+Java中是没有WeakHashSet这个类的，但是我们可以通过Collections这个工具类的newSetFromMap(new WeakHashMap<>())来构造一个WeakHashSet。
