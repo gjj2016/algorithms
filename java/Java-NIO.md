@@ -282,7 +282,7 @@ AbstractInterruptibleChannel抽象类中定义了一组协同方法begin()和end
 	            return k;
 	        }
 	    }
-- 关闭通道除了需要关闭通道之外，还需要把SelectionKey[]数组上的SelectionKey取消
+- 关闭通道除了需要关闭通道之外，还需要把SelectionKey[]数组上的SelectionKey取消，而SelectionKey类中的cancel()方法又会调用AbstractSelector中的cancel()方法，AbstractSelector类中的cancel()方法将这个SelectionKey加入到cancelledKeys集合中。
 
 	    protected final void implCloseChannel() throws IOException {
 	        implCloseSelectableChannel();
@@ -395,4 +395,442 @@ Selector是NIO得以实现的核心模块之一，NIO属于同步非阻塞IO，�
 		  }
 		}
 
+**AbstractSelector**：是一个抽象类，是Selector的基础实现类.
 
+- 定义了一个boolean类型的open变量，初始化为true，表示一个Selector创建时就为打开状态。
+- 定义了一个cancelledKeys集合，表示已经取消的SelectionKey的集合。SelectionKey中的cancel()方法会调用AbstractSelector类的cancel()方法，cancel()方法将SelectionKey加入到cancelledKeys集合中。
+
+	    void cancel(SelectionKey k) {                       // package-private
+	        synchronized (cancelledKeys) {
+	            cancelledKeys.add(k);
+	        }
+	    }
+
+- 定义了一个SelectorProvider对象，用于实现Selector类中的provider()方法。
+- 定义了一个反注册方法deregister(SelectionKey key)，调用的是channel的方法，将key从SelectionKey[] keys数组中移除
+
+	    protected final void deregister(AbstractSelectionKey key) {
+	        ((AbstractSelectableChannel)key.channel()).removeKey(key);
+	    }
+
+- 定义了一组协同方法begin()和end()，与AbstractInterruptibleChannel类中协同方法类似，在一个可能阻塞的IO操作前使用begin()方法，在IO操作之后使用end()方法，但是这里的协同方法是为了在产生中断之后使select()方法立即返回。
+
+	    protected final void begin() {
+	        if (interruptor == null) {
+	            interruptor = new Interruptible() {
+	                    public void interrupt(Thread ignore) {
+							//产生中断之后，调用wakeup()方法唤醒select()方法
+	                        AbstractSelector.this.wakeup();
+	                    }};
+	        }
+	        AbstractInterruptibleChannel.blockedOn(interruptor);
+	        Thread me = Thread.currentThread();
+	        if (me.isInterrupted())
+	            interruptor.interrupt(me);
+	    }
+
+**SelectorImpl**：仍然是一个抽象类，继承于AbstractSelector类，进一步实现了Selector类。
+
+- 定义了一个keys集合，用于实现Selector类的keys()方法，直接返回这个集合。
+- 定义了一个selectedKeys集合，用于实现Selector类的selectedKeys()方法，直接返回这个集合。
+- 将三个select()方法均委托给一个抽象方法，待子类进一步实现。
+
+		//委托给lockAndDoSelect()方法
+		public int select(long timeout) throws IOException{
+	              if (timeout < 0)
+	                  throw new IllegalArgumentException("Negative timeout");
+	              return lockAndDoSelect((timeout == 0) ? -1 : timeout);
+	    }
+		//调用上一个方法
+		public int select() throws IOException {
+             return select(0);
+        }
+		//委托给lockAndDoSelect()方法
+		public int selectNow() throws IOException {
+             return lockAndDoSelect(0);
+        }
+
+		//同步锁，进一步委托给doSelect(long time)这个抽象方法。
+		private int lockAndDoSelect(long timeout) throws IOException {
+              synchronized (this) {
+                  if (!isOpen())
+                      throw new ClosedSelectorException();
+                  synchronized (publicKeys) {
+                      synchronized (publicSelectedKeys) {
+                          return doSelect(timeout);
+                      }
+                  }
+              }
+          }
+
+- 进一步实现了close()方法，但是没有完全实现，还是委托给一个抽象方法
+
+ 		//先调用wakeup()方法使select()方法立即返回，然后同步锁，调用抽象方法implClose()
+		public void implCloseSelector() throws IOException {
+             wakeup();
+             synchronized (this) {
+                 synchronized (publicKeys) {
+                     synchronized (publicSelectedKeys) {
+                         implClose();
+                     }
+                 }
+             }
+         }
+
+- 初步实现了register(channel, int ops, Object att)方法，委托给抽象方法implRegister(SelectionKey k)方法
+
+		protected final SelectionKey register(AbstractSelectableChannel ch, int ops, Object attachment){
+             if (!(ch instanceof SelChImpl))
+                 throw new IllegalSelectorException();
+			//新建一个SelectionKey对象
+             SelectionKeyImpl k = new SelectionKeyImpl((SelChImpl)ch, this);
+			//设置附加信息
+             k.attach(attachment);
+             synchronized (publicKeys) {
+                 implRegister(k);
+             }
+			//设置感兴趣事件
+             k.interestOps(ops);
+             return k;
+         }
+- 定义了一个方法处理cancelledKeys集合，委托给抽象方法implDereg(SelectionKey k)方法
+
+	       void processDeregisterQueue() throws IOException {
+	             // Precondition: Synchronized on this, keys, and selectedKeys
+				//获取cancelledKeys集合
+	             Set cks = cancelledKeys();
+	             synchronized (cks) {
+	                 if (!cks.isEmpty()) {
+	                     Iterator i = cks.iterator();
+	                     while (i.hasNext()) {
+	                         SelectionKeyImpl ski = (SelectionKeyImpl)i.next();
+	                         try {
+	                             implDereg(ski);
+	                         } catch (SocketException se) {
+	                             IOException ioe = new IOException("Error deregistering key");
+	                             ioe.initCause(se);
+	                             throw ioe;
+	                         } finally {
+	                             i.remove();
+	                         }
+	                     }
+	                 }
+	             }
+	         }
+
+## SelectorProvider ##
+SelectorProvider为Selector、DatagramChannel、SocketChannel、ServerSocketChannel、Pipe这些Selector和channel提供打开方法。
+
+**SelectorProvider**：是一个抽象类
+
+-     public abstract DatagramChannel openDatagramChannel() throws IOException;打开UDP通信channel
+-     public abstract Pipe openPipe() throws IOException;打开一个管道
+-     public abstract AbstractSelector openSelector() throws IOException;打开一个Selector
+- public abstract ServerSocketChannel openServerSocketChannel() throws IOException;打开一个服务器socket channel
+-     public abstract SocketChannel openSocketChannel() throws IOException;打开一个TCP通信channel
+
+**SelectorProviderImpl**：是一个抽象类，是SelectorProvider的基础实现类。
+
+- 打开UDP通信channel，返回的是UDP channel的实现类对象。
+
+	 	public DatagramChannel openDatagramChannel() throws IOException   {  
+	        return new DatagramChannelImpl(this);  
+	    }  
+- 打开TCP通信channel，返回的是Socket channel的实现类对象。
+
+	    public SocketChannel openSocketChannel() throws IOException  {  
+	        return new SocketChannelImpl(this);  
+	    }  
+
+- 打开TCP通信服务器端的channel，返回的是ServerSocket channel的实现类对象。
+
+	    public ServerSocketChannel openServerSocketChannel() throws IOException  {  
+	        return new ServerSocketChannelImpl(this);  
+	    } 
+
+- 打开一个管道，返回的是pipe实现类对象。
+
+		public Pipe openPipe() throws IOException  {  
+	        return new PipeImpl(this);  
+	    }  
+- 打开Selector的方法没有实现，待子类实现。
+
+**WindowsSelectorProvider **：SelectorProvider的最终实现类，继承于SelectorProviderImpl。实现了Selector的打开方法
+
+- 打开Selector。调用的是Selector的最终实现类WindowsSelectorImpl，通过WindowsSelectorImpl的构造函数返回一个Selector
+
+		public AbstractSelector openSelector() throws IOException {
+              return new WindowsSelectorImpl(this);
+        }
+
+
+## 再看 channel ##
+
+**FileChannel**：是一个抽象类，继承于AbstractInterruptibleChannel类，没有继承SelectableChannel，即FileChannel无法注册到Selector上。FileChannel也无法以非阻塞模式读写。通过阻塞方式对文件读写。
+
+- 打开一个FileChannel，一般通过传统IO流获取FileChannel。但是FileChannel类中也定义了open()函数打开一个FileChannel，getChannel()方法底层就是调用的FileChannel的open()方法
+
+		FileInputStream fis = new FileInputStream("C:\\mycode\\hello.txt");
+		
+		FileChannel inChannel = fis.getChannel();
+
+- 从FileChannel读取数据:public abstract int read(ByteBuffer dst) throws IOException;将通道中的数据读出来,并写道指定ByteBuffer中.FileChannel也支持分散写,即写到多个ByteBuffer中.
+
+		public abstract long read(ByteBuffer[] dsts, int offset, int length) throws IOException;
+
+- 向FileChannel写数据: public abstract int write(ByteBuffer src) throws IOException;将ByteBuffer缓冲区中的数据写入到channel中.FileChannel也支持聚集写,即多个ByteBuffer中的数据写到channel中.
+
+		public abstract long write(ByteBuffer[] srcs, int offset, int length) throws IOException;
+
+- 在FileChannel的某个特定位置进行数据的读/写操作,改变文件position的位置.
+		
+		//获取文件position的位置
+		public abstract long position() throws IOException;
+
+		//设置文件position
+		public abstract FileChannel position(long newPosition) throws IOException;
+
+- 将channel中的数据写入到另一个channel，或将另一个channel中的数据写入到这个channel中
+
+		//将本channel中的数据写入到另一个“可写入”的channel，从另一个channel的position处开始写入
+    	public abstract long transferTo(long position, long count, WritableByteChannel target) throws IOException;
+
+		//将另一个channel中的数据写入到本channel中，从另一个channel的position处开始
+		public abstract long transferFrom(ReadableByteChannel src, long position, long count) throws IOException;
+
+- 获取channel关联的文件的大小
+
+		public abstract long size() throws IOException;
+
+- 截取一个指定大小的文件，截断channel关联的文件为size大小，size之后的数据会被丢弃
+
+		public abstract FileChannel truncate(long size) throws IOException;
+
+**DatagramChannel**：是一个抽象类，真正的实现类是其子类DatagramChannelImpl，继承于AbstractSelectableChannel类。因此有阻塞和非阻塞两种模式，在非阻塞模式下可以注册到Selector上。UDP通信的channel。
+
+- 创建一个DatagramChannel。调用DatagramChannel的静态方法open()，通过SelectorProvider去创建DatagramChannelImpl的实例
+
+	    public static DatagramChannel open() throws IOException {
+        	return SelectorProvider.provider().openDatagramChannel();
+    	}
+- DatagramChannel支持的事件：读和写
+
+	    public final int validOps() {
+        	return (SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+    	}
+
+- 报文流本来是无连接的，在没有连接到一个指定地址时，channel可以同时发送数据报到多个远程地址、也可以同时从多个远程地址接收数据报。通过DatagramChannel的send(ByteBuffer src, SocketAddress add)方法发送数据报到指定远程地址，通过DatagramChannel的receive(ByteBuffer dst)方法从任意远程地址接收数据报，receive()方法会返回一个SocketAddress对象用以标识数据报来自哪个远程地址。在没有建立连接的时候，每一次调用send()方法发送数据报或者调用receive()方法接收数据报时都会接收安全检查。
+
+		//发送数据报到指定远程地址
+	    public abstract int send(ByteBuffer src, SocketAddress target) throws IOException;
+	
+		//从任意远程地址接收数据报，并返回数据来自哪个地址
+		public abstract SocketAddress receive(ByteBuffer dst) throws IOException;
+
+- 报文流也可以建立连接。建立连接后，channel将只能从指定的远程地址接收数据报、同时也只能发送数据报到指定的远程地址。由于已经连接到了指定的远程地址，因此在发送或者接收数据报的时候可以调用write()方法已经read()方法。write(ByteBuffer src)方法将数据报发送到指定远程地址、read(ByteBuffer dst)方法从指定远程地址接收数据报。指定连接到指定远程地址的channel才能调用write()方法和read()方法，每次调用write()方法和read()方法时不需要接收安全检查。**将DatagramChannel置于已连接的状态可以使除了它所“连接”到的地址之外的任何其他源地址的数据报被忽略。这是很有帮助的，因为不想要的包都已经被网络层丢弃了，从而避免了使用代码来接收、检查然后丢弃包的麻烦。**
+		
+		//将channel连接到指定远程地址
+    	public abstract DatagramChannel connect(SocketAddress remote) throws IOException;
+
+		//断开channel与远程地址间的连接
+		public abstract DatagramChannel disconnect() throws IOException;
+
+		//channel是否连接到了某个远程地址
+		public abstract boolean isConnected();
+
+		//发送数据报到指定远程地址，支持聚集写
+		public abstract int write(ByteBuffer src) throws IOException;
+		public final long write(ByteBuffer[] srcs) throws IOException {
+        	return write(srcs, 0, srcs.length);
+    	}
+		public abstract long write(ByteBuffer[] srcs, int offset, int length) throws IOException;
+
+		//从指定远程地址接收数据报，支持分散读
+		public abstract int read(ByteBuffer dst) throws IOException;
+		public final long read(ByteBuffer[] dsts) throws IOException {
+        	return read(dsts, 0, dsts.length);
+    	}
+		public abstract long read(ByteBuffer[] dsts, int offset, int length) throws IOException;
+
+- 如果channel处于阻塞模式：调用send()方法或者write()方法，调用线程可能会休眠直到数据报被加入传输队列。如果channel是非阻塞的：send()方法或者write()方法、read()返回值要么是字节缓冲区的字节数，要么是“0”，receive()方法的返回值要么是远程地址对象要么是null。
+
+- 报文流可以绑定也可以不绑定。如果channel负责监听，那么必须绑定到一个指定端口，channel将会一直监听这个端口。当channel没有绑定的时候，仍然能够接收数据报，使用的是动态分配的端口号。已经绑定的channel将从指定端口接收或者发送数据报。
+
+- 报文流是不可靠传输。1）假如receive()方法提供的ByteBuffer没有足够的剩余空间来存放您正在接收的数据包，没有被填充的字节都会被悄悄地丢弃。2）如果send()方法给定的ByteBuffer传输队列没有足够空间来承载整个数据报，那么什么内容都不会被发送。3）传输过程中的协议可能将数据报分解成碎片。例如，以太网不能传输超过1,500个字节左右的包。如果您的数据报比较大，那么就会存在被分解成碎片的风险，成倍地增加了传输过程中包丢失的几率。被分解的数据报在目的地会被重新组合起来，接收者将看不到碎片。但是，如果有一个碎片不能按时到达，那么整个数据报将被丢弃。
+
+**SocketChannel**：是一个抽象类，真正的实现类是其子类SocketChannelImpl，继承于AbstractSelectableChannel类。因此有阻塞和非阻塞两种模式，在非阻塞模式下可以注册到Selector上。客户端的TCP通信的channel。
+
+- 创建一个SocketChannel对象，通过SocketChannel的静态方法open委托给SelectorProvider类创建SocketChannelImpl类对象。
+
+	    public static SocketChannel open() throws IOException {
+	        return SelectorProvider.provider().openSocketChannel();
+	    }
+
+- SocketChannel支持的事件：读、写、发起连接
+
+    public final int validOps() {
+        return (SelectionKey.OP_READ | SelectionKey.OP_WRITE | SelectionKey.OP_CONNECT);
+    }
+
+- channel必须在使用之前连接到远程地址，在阻塞模式下，连接操作会一直阻塞直到连接成功或者失败；在非阻塞模式下，连接操作即使没有连接成功也会立刻返回，因此需要通过finishConnect()方法判断是否连接成功并一直尝试连接。
+
+		//channel是否成连接到一个远程地址
+		public abstract boolean isConnected();
+
+		//channel是否正处于连接中
+		public abstract boolean isConnectionPending();
+
+		//channel连接一个远程地址
+		public abstract boolean connect(SocketAddress remote) throws IOException;
+
+		//channel是否完成了连接
+		public abstract boolean finishConnect() throws IOException;
+
+		while(!channel.finishConnect()){
+			//由于必须在连接成功之后才能进行IO操作，必须等待连接成功
+			doSomethingElse();
+		}
+
+
+- 往channel中写数据，支持聚集写。写完之后，Selector的select()方法会检测到这个channel的WRITE事件就绪了
+		
+		public abstract int write(ByteBuffer src) throws IOException;
+	
+		public final long write(ByteBuffer[] srcs) throws IOException {
+	        return write(srcs, 0, srcs.length);
+	    }
+	
+	    public abstract long write(ByteBuffer[] srcs, int offset, int length) throws IOException;
+	
+- 从channel中读取数据，支持分散读。Selector的select()方法会检测到这个channel的READ事件就绪了
+
+	    public abstract int read(ByteBuffer dst) throws IOException;
+	
+	    public final long read(ByteBuffer[] dsts) throws IOException {
+	        return read(dsts, 0, dsts.length);
+	    }    
+		public abstract long read(ByteBuffer[] dsts, int offset, int length) throws IOException;
+
+SocketChannel的一个实例：
+
+		public class MyClient {
+			private static Selector selector = null;
+		    private volatile static boolean stop = false;
+		    private static SocketChannel channel = null;
+			
+			public static void main(String[] args) {
+		        selector = Selector.open();
+				try {
+		            channel = SocketChannel.open();
+		            channel.configureBlocking(false);
+		            channel.connect(new InetSocketAddress("127.0.0.1", 7777));
+					//注册一个连接请求事件
+		            channel.register(selector, SelectionKey.OP_CONNECT);
+		
+					try {
+			            while (!stop) {
+			                selector.select();
+			                Set<SelectionKey> selectedKeys = selector.selectedKeys();
+			                Iterator<SelectionKey> iterator = selectedKeys.iterator();
+			                while (iterator.hasNext()) {
+			                    SelectionKey key = iterator.next();
+								//连接就绪
+			                    if (key.isConnectable()) {
+									//服务器接收了连接请求
+		                			SocketChannel sc = (SocketChannel) key.channel();
+							        if (sc.finishConnect()) {
+							            // 将关注的事件变成read
+							            sc.register(selector, SelectionKey.OP_READ);
+							            doWrite(sc, "dddddd");
+							        }
+					            }
+					            // 读就绪
+					            if (key.isReadable()) {
+					                //服务器有数据过来了，处理数据，再发送数据
+					            }
+			                    iterator.remove();
+			                }
+			
+			            }
+			        } catch (IOException e) {
+			            e.printStackTrace();
+			        }
+		        } catch (ClosedChannelException e) {
+		            System.out.println("client: 失去主机连接");
+		            e.printStackTrace();
+		        } catch (IOException e) {
+		            e.printStackTrace();
+		        }
+		    }
+		}
+
+**ServerSocketChannel**：是一个抽象类，真正的实现类是其子类ServerSocketChannelImpl，继承于AbstractSelectableChannel类。因此有阻塞和非阻塞两种模式，在非阻塞模式下可以注册到Selector上。服务器端的TCP通信的channel。
+
+- 创建一个ServerSocketChannel，通过ServerSocketChannel的静态方法open委托给SelectorProvider类创建ServerSocketChannelImpl类对象。
+
+	    public static ServerSocketChannel open() throws IOException {
+	        return SelectorProvider.provider().openServerSocketChannel();
+	    }
+
+- ServerSocketChannel支持的事件：接收连接
+
+	    public final int validOps() {
+	        return SelectionKey.OP_ACCEPT;
+	    }
+
+- ServerSocketChannel必须先绑定到一个端口上，一直监听这个端口。
+
+    	public abstract ServerSocketChannel bind(SocketAddress local, int backlog) throws IOException;
+
+- 获取与这个ServerSocketChannel关联的SocketChannel，即发起连接请求的SocketChannel
+
+		public abstract SocketChannel accept() throws IOException;
+
+ServerSocketChannel的一个实例：
+
+	public class MyService {
+	    public static Selector selector = null;
+	
+	    public static void main(String[] args) {
+	        selector = Selector.open();// 打开selector
+			ServerSocketChannel server = ServerSocketChannel.open();
+	        server.socket().bind(new InetSocketAddress(7777), 1024);
+	        server.configureBlocking(false);
+			//服务器开始监听等待连接，注册ACCEPT事件
+	        server.register(selector, SelectionKey.OP_ACCEPT);
+	
+			while (true) {
+	            try {
+	                selector.select(1000); // 阻塞selector
+	                // ================如果有新连接
+	                Set<SelectionKey> selectedKeys = selector.selectedKeys();// 获得事件集合;
+	                // ================遍历selectedKeys
+	                Iterator<SelectionKey> iterator = selectedKeys.iterator();
+	                SelectionKey key = null;
+	                while (iterator.hasNext()) {
+	                    key = iterator.next();// 获得到当前的事件
+	                    // ===============处理事件
+	                     // 连接就绪，有客户端请求连接，注册的事件发生
+			            if (key.isAcceptable()) {
+			                // 获得对应的ServerSocketChannel
+					        ServerSocketChannel ssc = (ServerSocketChannel) key.channel();
+					        // 得到对应的SocketChannel 
+					        SocketChannel channel = ssc.accept();
+					        // 处理socketChannel
+					        channel.configureBlocking(false); 
+					        channel.register(selector, SelectionKey.OP_READ); 
+			            }
+			            // 读就绪
+			            if (key.isReadable()) {
+			                //客户端有数据过来了，之前注册的READ事件来了
+							
+			            }
+	                    // ===============
+	                    iterator.remove(); // 移除事件
+	                }
+	            } catch (IOException e) {
+	                e.printStackTrace();
+	            }
+	        }
+	    }
+	｝
